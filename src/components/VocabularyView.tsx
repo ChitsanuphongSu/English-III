@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { VOCABULARY_LIST, TOPICS } from '../data/vocabulary';
 import { VocabItem, UserStats, TopicId } from '../types';
 import { saveUserStats } from '../utils/analytics';
@@ -20,6 +20,19 @@ interface VocabularyViewProps {
   stats: UserStats;
   onUpdateStats: (newStats: UserStats) => void;
   initialTopicId?: string;
+}
+
+/**
+ * Fisher-Yates (Knuth) unbiased shuffle.
+ * Returns a new shuffled array without mutating the input.
+ */
+function fisherYatesShuffle<T>(array: T[]): T[] {
+  const result = [...array];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 }
 
 export const VocabularyView: React.FC<VocabularyViewProps> = ({
@@ -53,7 +66,10 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
 
   const currentItem: VocabItem | undefined = filteredVocab[currentIndex];
 
-  const handleMarkStatus = (vocabId: string, status: 'known' | 'review') => {
+  // ─── STATUS-ONLY UPDATE (no navigation) ───────────────────────────
+  // Updates vocabulary learning status without changing currentIndex,
+  // flipping flashcards, or resetting quiz feedback.
+  const updateVocabularyStatus = (vocabId: string, status: 'known' | 'review') => {
     const updatedStatus = {
       ...stats.vocabularyStatus,
       [vocabId]: status
@@ -64,6 +80,12 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
     };
     onUpdateStats(newStats);
     saveUserStats(newStats);
+  };
+
+  // ─── FLASHCARD: mark status AND advance card ──────────────────────
+  // Preserves existing flashcard UX: save status, then move to next card.
+  const handleMarkStatus = (vocabId: string, status: 'known' | 'review') => {
+    updateVocabularyStatus(vocabId, status);
 
     // Next Card
     setIsFlipped(false);
@@ -90,17 +112,98 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
     }
   };
 
-  // Generate 4 Quiz Options for Mode B & C
-  const getQuizOptions = (item: VocabItem, mode: 'meaning-to-word' | 'word-to-meaning') => {
-    const otherItems = VOCABULARY_LIST.filter(v => v.id !== item.id);
-    const shuffledOthers = [...otherItems].sort(() => 0.5 - Math.random()).slice(0, 3);
-    
-    if (mode === 'meaning-to-word') {
-      const options = [item.word, ...shuffledOthers.map(o => o.word)];
-      return options.sort(() => 0.5 - Math.random());
+  // ─── STABLE QUIZ OPTIONS (memoized per question + mode) ───────────
+  // Options are generated ONCE per (currentItem.id, activeMode) pair
+  // and remain stable through re-renders, answer selection, and feedback.
+  const quizOptions = useMemo(() => {
+    if (!currentItem) return [];
+    if (activeMode !== 'meaning-to-word' && activeMode !== 'word-to-meaning') return [];
+
+    const otherItems = VOCABULARY_LIST.filter(v => v.id !== currentItem.id);
+    const shuffledOthers = fisherYatesShuffle(otherItems).slice(0, 3);
+
+    if (activeMode === 'meaning-to-word') {
+      // Ensure no duplicate words in options
+      const correctAnswer = currentItem.word;
+      const distractors = shuffledOthers
+        .map(o => o.word)
+        .filter(w => w !== correctAnswer);
+      // Take exactly 3 unique distractors (re-pick if needed due to duplicates)
+      const uniqueDistractors: string[] = [];
+      const seen = new Set<string>([correctAnswer]);
+      for (const d of distractors) {
+        if (!seen.has(d) && uniqueDistractors.length < 3) {
+          seen.add(d);
+          uniqueDistractors.push(d);
+        }
+      }
+      // If we need more distractors (unlikely but safe)
+      if (uniqueDistractors.length < 3) {
+        for (const item of otherItems) {
+          if (!seen.has(item.word) && uniqueDistractors.length < 3) {
+            seen.add(item.word);
+            uniqueDistractors.push(item.word);
+          }
+        }
+      }
+      return fisherYatesShuffle([correctAnswer, ...uniqueDistractors]);
     } else {
-      const options = [item.meaningTh, ...shuffledOthers.map(o => o.meaningTh)];
-      return options.sort(() => 0.5 - Math.random());
+      // word-to-meaning
+      const correctAnswer = currentItem.meaningTh;
+      const distractors = shuffledOthers
+        .map(o => o.meaningTh)
+        .filter(m => m !== correctAnswer);
+      const uniqueDistractors: string[] = [];
+      const seen = new Set<string>([correctAnswer]);
+      for (const d of distractors) {
+        if (!seen.has(d) && uniqueDistractors.length < 3) {
+          seen.add(d);
+          uniqueDistractors.push(d);
+        }
+      }
+      if (uniqueDistractors.length < 3) {
+        for (const item of otherItems) {
+          if (!seen.has(item.meaningTh) && uniqueDistractors.length < 3) {
+            seen.add(item.meaningTh);
+            uniqueDistractors.push(item.meaningTh);
+          }
+        }
+      }
+      return fisherYatesShuffle([correctAnswer, ...uniqueDistractors]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentItem?.id, activeMode]);
+
+  // ─── QUIZ ANSWER HANDLER ──────────────────────────────────────────
+  // Handles answer selection WITHOUT advancing the question.
+  // Remains on the same question to show feedback.
+  const handleQuizAnswer = (selectedOpt: string) => {
+    if (!currentItem) return;
+    // Ignore clicks if already answered
+    if (isAnswerChecked) return;
+
+    const correctAnswer = activeMode === 'meaning-to-word'
+      ? currentItem.word
+      : currentItem.meaningTh;
+    const isCorrect = selectedOpt === correctAnswer;
+
+    setSelectedAnswer(selectedOpt);
+    setIsAnswerChecked(true);
+
+    // Update vocabulary status only — do NOT advance
+    updateVocabularyStatus(currentItem.id, isCorrect ? 'known' : 'review');
+  };
+
+  // ─── NEXT QUIZ QUESTION ───────────────────────────────────────────
+  // Advances exactly one question after the current one has been answered.
+  const handleNextQuizQuestion = () => {
+    if (!isAnswerChecked) return; // Only allow after answering
+    setSelectedAnswer(null);
+    setIsAnswerChecked(false);
+    if (currentIndex < filteredVocab.length - 1) {
+      setCurrentIndex(currentIndex + 1);
+    } else {
+      setCurrentIndex(0); // Wrap to first question (preserving existing behavior)
     }
   };
 
@@ -128,7 +231,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
         <button
           id="vocab-mode-flashcard"
           className={`btn btn-sm ${activeMode === 'flashcard' ? 'btn-primary' : 'btn-outline'}`}
-          onClick={() => { setActiveMode('flashcard'); setIsFlipped(false); }}
+          onClick={() => { setActiveMode('flashcard'); setIsFlipped(false); setSelectedAnswer(null); setIsAnswerChecked(false); }}
         >
           <RotateCw size={14} />
           Flashcard Memorization
@@ -153,7 +256,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
         <button
           id="vocab-mode-table"
           className={`btn btn-sm ${activeMode === 'table' ? 'btn-primary' : 'btn-outline'}`}
-          onClick={() => setActiveMode('table')}
+          onClick={() => { setActiveMode('table'); setSelectedAnswer(null); setIsAnswerChecked(false); }}
         >
           <BookOpen size={14} />
           Full Vocabulary Bank ({VOCABULARY_LIST.length} Words)
@@ -178,7 +281,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
             type="text"
             placeholder="ค้นหาคำศัพท์ ความหมาย หรือตัวอย่างประโยค..."
             value={searchTerm}
-            onChange={(e) => { setSearchTerm(e.target.value); setCurrentIndex(0); }}
+            onChange={(e) => { setSearchTerm(e.target.value); setCurrentIndex(0); setSelectedAnswer(null); setIsAnswerChecked(false); }}
             style={{
               width: '100%',
               padding: '0.6rem 0.75rem 0.6rem 2.25rem',
@@ -194,7 +297,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
         <select
           id="vocab-topic-filter"
           value={selectedTopic}
-          onChange={(e) => { setSelectedTopic(e.target.value); setCurrentIndex(0); }}
+          onChange={(e) => { setSelectedTopic(e.target.value); setCurrentIndex(0); setSelectedAnswer(null); setIsAnswerChecked(false); }}
           style={{
             padding: '0.6rem 1rem',
             borderRadius: 'var(--radius-md)',
@@ -416,7 +519,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
               </h3>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                {getQuizOptions(currentItem, activeMode as any).map((opt, i) => {
+                {quizOptions.map((opt, i) => {
                   const isCorrectTarget = activeMode === 'meaning-to-word' ? opt === currentItem.word : opt === currentItem.meaningTh;
                   const isSelected = selectedAnswer === opt;
                   
@@ -433,15 +536,7 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
                       key={i}
                       className={btnClass}
                       disabled={isAnswerChecked}
-                      onClick={() => {
-                        setSelectedAnswer(opt);
-                        setIsAnswerChecked(true);
-                        if (isCorrectTarget) {
-                          handleMarkStatus(currentItem.id, 'known');
-                        } else {
-                          handleMarkStatus(currentItem.id, 'review');
-                        }
-                      }}
+                      onClick={() => handleQuizAnswer(opt)}
                     >
                       <span>{opt}</span>
                       {isAnswerChecked && isCorrectTarget && <Check size={18} color="var(--success)" />}
@@ -454,12 +549,9 @@ export const VocabularyView: React.FC<VocabularyViewProps> = ({
               {isAnswerChecked && (
                 <div style={{ marginTop: '1.25rem', textAlign: 'right' }}>
                   <button 
+                    id="quiz-btn-next"
                     className="btn btn-primary"
-                    onClick={() => {
-                      setSelectedAnswer(null);
-                      setIsAnswerChecked(false);
-                      handleNextCard();
-                    }}
+                    onClick={handleNextQuizQuestion}
                   >
                     ข้อถัดไป
                     <ArrowRight size={16} />
